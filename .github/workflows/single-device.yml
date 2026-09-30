@@ -1,0 +1,218 @@
+name: Build Single Device
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_branch:
+        required: true
+        type: string
+      device_model:
+        required: true
+        type: string
+      build_type:
+        required: true
+        type: string
+        default: 'Bazel'
+      release_type:
+        required: true
+        type: string
+        default: 'Actions'
+      lto:
+        required: true
+        type: string
+        default: 'default'
+      ksun:
+        required: true
+        type: string
+        default: 'true'
+      susfs:
+        required: true
+        type: string
+        default: 'true'
+      zeromount:
+        required: true
+        type: string
+        default: 'false'
+      nomount:
+        required: true
+        type: string
+        default: 'true'
+      bbg:
+        required: true
+        type: string
+        default: 'true'
+      unicodefix:
+        required: true
+        type: string
+        default: 'true'
+      droidspace:
+        required: true
+        type: string
+        default: 'true'
+      ntsync:
+        required: true
+        type: string
+        default: 'true'
+      bbrv3:
+        required: true
+        type: string
+        default: 'true'
+      cache:
+        required: true
+        type: string
+        default: 'true'
+      ipv6_nat:
+        required: true
+        type: string
+        default: 'true'
+      optimization:
+        required: true
+        type: string
+        default: 'true'
+      ttl:
+        required: true
+        type: string
+        default: 'true'
+      boot_img_url:
+        required: false
+        type: string
+        default: ''
+      boot_img_b64:
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build-single:
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      branch: ${{ inputs.device_branch }}
+      build_type: ${{ inputs.build_type }}
+      susfs: ${{ inputs.susfs }}
+      bbg: ${{ inputs.bbg }}
+      unicodefix: ${{ inputs.unicodefix }}
+      zeromount: ${{ inputs.zeromount }}
+      nomount: ${{ inputs.nomount }}
+      ksun: ${{ inputs.ksun }}
+      droidspace: ${{ inputs.droidspace }}
+      ntsync: ${{ inputs.ntsync }}
+      bbrv3: ${{ inputs.bbrv3 }}
+      cache: ${{ inputs.cache }}
+      ipv6_nat: ${{ inputs.ipv6_nat }}
+      optimization: ${{ inputs.optimization }}
+      ttl: ${{ inputs.ttl }}
+      lto: ${{ inputs.lto }}
+
+  # ==========================================================
+  #  REPACK para Odin (opcional — só roda se boot.img for dado)
+  # ==========================================================
+  repackage-odin:
+    needs: build-single
+    runs-on: ubuntu-22.04
+    if: ${{ inputs.boot_img_url != '' || inputs.boot_img_b64 != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lz4 unzip zip curl
+
+      - name: Download AnyKernel3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Extract Image from AnyKernel3
+        run: |
+          echo "=== Artifacts baixados ==="
+          find ./artifacts -type f | head -20
+
+          IMAGE=""
+          for f in $(find ./artifacts -name "*.zip" -type f); do
+            echo "Extraindo: $f"
+            mkdir -p ./ak3_extract
+            unzip -o "$f" -d ./ak3_extract 2>/dev/null || continue
+            FOUND=$(find ./ak3_extract -name "Image" -type f | head -1)
+            if [ -n "$FOUND" ]; then
+              IMAGE="$FOUND"
+              break
+            fi
+            rm -rf ./ak3_extract
+          done
+
+          if [ -z "$IMAGE" ]; then
+            IMAGE=$(find ./artifacts -name "Image" -type f | head -1)
+          fi
+
+          if [ -z "$IMAGE" ]; then
+            echo "❌ Image não encontrada nos artefatos"
+            exit 1
+          fi
+
+          cp "$IMAGE" ./Image
+          echo "✅ Image: $IMAGE"
+          ls -lh ./Image
+
+      - name: Download boot.img
+        run: |
+          if [ -n "${{ inputs.boot_img_url }}" ]; then
+            curl -fSL --retry 3 -o boot.img.download "${{ inputs.boot_img_url }}"
+          elif [ -n "${{ inputs.boot_img_b64 }}" ]; then
+            echo "${{ inputs.boot_img_b64 }}" | base64 -d > boot.img.download
+          else
+            echo "❌ Nenhum boot.img fornecido"; exit 1
+          fi
+          ls -lh boot.img.download
+
+          MAGIC=$(od -An -tx1 -N4 boot.img.download | tr -d ' \n')
+          echo "Magic bytes: $MAGIC"
+
+          if [ "$MAGIC" = "04224d18" ]; then
+            echo "▶ Arquivo é LZ4 — descomprimindo..."
+            lz4 -d -f boot.img.download boot.img
+          else
+            echo "▶ Arquivo NÃO é LZ4 — usando direto..."
+            mv boot.img.download boot.img
+          fi
+
+          echo "=== Tipo do arquivo final ==="
+          file boot.img
+          ls -lh boot.img
+
+      - name: Repack with magiskboot
+        run: |
+          curl -fSL --retry 3 -o magiskboot \
+            "https://raw.githubusercontent.com/Uevo001/magiskboot-linux/main/x86_64/magiskboot"
+          chmod +x magiskboot
+          ./magiskboot --version || true
+
+          ./magiskboot unpack boot.img
+          cp ./Image kernel
+          ./magiskboot repack boot.img boot_patched.img
+
+          mv boot_patched.img boot.img
+          mkdir -p odin_package
+          cp boot.img odin_package/boot.img
+          cd odin_package
+          tar -cvf ../boot.tar boot.img
+          cd ..
+          md5sum -t boot.tar >> boot.tar
+          mv boot.tar boot.tar.md5
+
+          echo "=== Conteúdo do tar.md5 ==="
+          tar -tvf boot.tar.md5
+          ls -lh boot.tar.md5
+
+      - name: Upload boot.tar.md5
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-${{ inputs.device_model }}-odin
+          path: boot.tar.md5
+          if-no-files-found: warn
